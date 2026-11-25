@@ -1,0 +1,117 @@
+name: Build LineageOS 24.0 alioth Kernel (BakaSU + SUSFS)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Maximize Build Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 device-tree-compiler
+
+      - name: Clone LineageOS 24.0 Kernel Source
+        run: |
+          git clone --depth=1 https://github.com -b lineage-24.0 kernel
+
+      - name: Clone Toolchains (Proton Clang + GCC 4.9)
+        run: |
+          mkdir -p toolchains
+          git clone --depth=1 https://github.com toolchains/clang
+          git clone --depth=1 https://googlesource.com -b android-11.0.0_r48 toolchains/gcc64
+          git clone --depth=1 https://googlesource.com -b android-11.0.0_r48 toolchains/gcc32
+
+      - name: Integrate BakaSU & SUSFS 4.19
+        working-directory: kernel
+        run: |
+          # 1. 拉取 BakaSU 驱动
+          curl -LSs "https://githubusercontent.com" | bash -s main
+
+          # 2. 拉取 SUSFS 4.19 官方反向移植补丁
+          git clone --depth=1 https://gitlab.com -b kernel-4.19 ../susfs4ksu
+          cp ../susfs4ksu/kernel_patches/fs/* fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/
+
+          # 3. 应用 SUSFS 内核补丁（包含 SUSFS Inline Hook）
+          patch -p1 --fuzz=3 < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
+
+      - name: Configure Defconfig
+        working-directory: kernel
+        run: |
+          DEFCONFIG="arch/arm64/configs/vendor/alioth_defconfig"
+          [ ! -f "$DEFCONFIG" ] && DEFCONFIG="arch/arm64/configs/alioth_defconfig"
+
+          cat << 'EOF' >> "$DEFCONFIG"
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=n
+          CONFIG_KPROBES=n
+          CONFIG_HAVE_KPROBES=n
+          CONFIG_KPROBE_EVENTS=n
+          EOF
+
+      - name: Compile Kernel
+        working-directory: kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$GITHUB_WORKSPACE/toolchains/gcc64/bin:$GITHUB_WORKSPACE/toolchains/gcc32/bin:$PATH"
+
+          if [ -f "arch/arm64/configs/vendor/alioth_defconfig" ]; then
+            make O=out ARCH=arm64 vendor/alioth_defconfig
+          else
+            make O=out ARCH=arm64 alioth_defconfig
+          fi
+
+          make -j$(nproc) O=out \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            LD=ld.lld \
+            LLVM=1 \
+            LLVM_IAS=1
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com
+          sed -i 's/device.name1=maguro/device.name1=alioth/g' AnyKernel3/anykernel.sh
+          sed -i 's/device.name2=toro/device.name2=aliothin/g' AnyKernel3/anykernel.sh
+          sed -i 's/do.devicecheck=1/do.devicecheck=1/g' AnyKernel3/anykernel.sh
+          sed -i 's!block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!block=/dev/block/bootdevice/by-name/boot;!g' AnyKernel3/anykernel.sh
+
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/
+          [ -f kernel/out/arch/arm64/boot/dtbo.img ] && cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/
+
+          cd AnyKernel3
+          zip -r9 ../BakaSU-SUSFS-alioth-LineageOS24.zip * -x .git README.md *placeholder
+
+      - name: Upload Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BakaSU-SUSFS-alioth-LineageOS24
+          path: BakaSU-SUSFS-alioth-LineageOS24.zip
